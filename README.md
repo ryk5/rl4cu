@@ -1,8 +1,23 @@
 # rl4cu
 
-using reinforcement learning to teach llms how to write fast cuda kernels. inspired by hls4ml. the idea is that llms are actually pretty bad at writing optimized gpu code out of the box — they can get something that compiles and is maybe correct, but rarely something that's actually fast. so im using execution-based rl with rewards tied to correctness + speedup vs pytorch baseline to push the model to learn what actually makes a kernel good.
+using reinforcement learning to teach llms how to write fast cuda kernels. inspired by hls4ml. the idea is that llms are actually pretty bad at writing optimized gpu code out of the box — they can get something that compiles and is maybe correct, but rarely something that's actually fast. so i'm using execution-based rl with rewards tied to correctness + speedup vs pytorch baseline to push the model to learn what actually makes a kernel good.
 
-benchmarking against [kernelbench (stanford, icml 2025)](https://arxiv.org/abs/2502.10517) — 250 problems ranging from single ops to full model architectures. infra runs on modal so i can parallelize kernel compilation + evaluation across many gpus at once.
+benchmarking against [kernelbench (stanford, icml 2025)](https://arxiv.org/abs/2502.10517) — 250 problems ranging from single ops to full model architectures. infra runs on modal so i can parallelize kernel compilation + evaluation across many h100s at once.
+
+---
+
+## results so far
+
+**zero-shot baseline — qwen2.5-coder-32b-instruct, kernelbench level 1 (20 problems)**
+
+| metric | value |
+|---|---|
+| compiled | 14/20 (70%) |
+| correct | 10/20 (50%) |
+| fast_1 (correct + faster than pytorch) | 0/20 (0%) |
+| avg speedup on correct kernels | ~0.14x |
+
+so yeah — 50% of kernels are correct, but every single one is slower than pytorch. the best i saw was 0.64x (still 1.6× slower). the worst was 0.001x — a kernel that took 1800ms for something pytorch does in 2.6ms. that's the gap i'm trying to close with rl.
 
 ---
 
@@ -10,11 +25,11 @@ benchmarking against [kernelbench (stanford, icml 2025)](https://arxiv.org/abs/2
 
 two papers are most relevant:
 
-- **[kevin](https://arxiv.org/abs/2507.11948)** (cognition ai, july 2025) — multi-turn grpo on cuda kernels using qwq-32b. trains on every refinement turn individually, summarizes cots across turns to avoid context blowup. 180 kernelbench tasks. reward = correctness + correctness × speedup. key limitation: uses standard grpo which has a biased advantage estimator in multi-turn settings (current sample included in its own group mean baseline).
+- **[kevin](https://arxiv.org/abs/2507.11948)** (cognition ai, july 2025) — multi-turn grpo on cuda kernels using qwq-32b. trains on every refinement turn individually, summarizes cots across turns to avoid context blowup. 180 kernelbench tasks. reward = correctness + correctness × speedup. key limitation: uses standard grpo which has a biased advantage estimator in multi-turn settings (current sample is included in its own group mean baseline).
 
-- **[dr. kernel](https://arxiv.org/abs/2602.05885)** (hkust, feb 2026) — fixes kevin's bias issue with trloo (turn-level reinforce leave-one-out), which excludes the current sample from the baseline. also adds profiling-based rewards (pr) and rejection sampling (prs) to prevent "lazy optimization" (model learning to speed up tiny unimportant sub-ops instead of the actual bottleneck). triton only, qwen3-14b, cold-start sft on 8k gpt-5 trajectories before rl. beats claude-4.5-sonnet and gpt-5 on kernelbench l2 (31.6% fast_1.2).
+- **[dr. kernel](https://arxiv.org/abs/2602.05885)** (hkust, feb 2026) — fixes kevin's bias issue with trloo (turn-level reinforce leave-one-out), which excludes the current sample from the baseline. also adds profiling-based rewards (pr) and rejection sampling (prs) to prevent "lazy optimization" — the model learning to speed up tiny unimportant sub-ops instead of the actual bottleneck. triton only, qwen3-14b, cold-start sft on 8k gpt-5 trajectories before rl. beats claude-4.5-sonnet and gpt-5 on kernelbench l2 (31.6% fast_1.2).
 
-**the gap**: i want to combine trloo (dr. kernel recommended this)+ profiling-aware rewards on *cuda* (not triton), at 32b scale (need to avoid lazy optimizations, a naive speedup reward is just the total wall time), with a proper cold-start sft phase and a progressive reward curriculum (dont waste early training steps).
+**the gap i'm targeting**: combining trloo + profiling-aware rewards on *cuda* (not triton), at 32b scale, with a cold-start sft phase and a progressive reward curriculum. none of the prior work does all of this together.
 
 ---
 
@@ -22,8 +37,8 @@ two papers are most relevant:
 
 ### base model
 - **qwen2.5-coder-32b-instruct** — code-specialized, apache 2.0, strong on systems-level code
-- why not qwq-32b (what kevin uses): qwq is reasoning-tuned but not code-specialized. nobody has compared these directly on cuda kernel tasks — worth ablating later
-- why not qwen3-14b (what dr. kernel uses): going bigger at 32b to push the ceiling, and staying on a code-specialized model
+- why not qwq-32b (what kevin uses): qwq is reasoning-tuned but not code-specialized. nobody has compared them directly on cuda kernel tasks — worth ablating later
+- why not qwen3-14b (what dr. kernel uses): i want to go bigger at 32b and stay on a code-specialized model
 
 ### fine-tuning strategy
 - **phase 1**: lora (rank=16, targets: q/v/o projections) — fast iteration, fits on 2×h100-80gb with tensor parallelism
@@ -35,26 +50,26 @@ two papers are most relevant:
 - **advantage estimation**: **trloo** (dr. kernel's fix) instead of standard grpo — excludes current sample from group mean, unbiased in multi-turn settings. `A = (N/(N-1)) * (G_i - Ḡ)`
 - **training framework**: verl + vllm — what kernelgym (dr. kernel's env) is built on, handles decoupled rollout/training workers across multi-gpu setups
 
-### the three novel contributions vs prior work
+### three things i'm doing differently vs prior work
 
 **1. trloo on cuda (not triton)**
-dr. kernel shows trloo fixes biased advantage estimation in multi-turn settings, but only on triton. kevin does cuda but with biased grpo. we're the first to apply trloo to cuda kernel rl.
+dr. kernel shows trloo fixes biased advantage estimation in multi-turn settings, but only demonstrates it on triton. kevin does cuda but uses standard biased grpo. i'm combining the two — trloo applied to cuda kernel rl.
 
 **2. profiling-aware reward on cuda**
-dr. kernel's pr/prs (reward the model for optimizing the actual runtime bottleneck, not trivial sub-ops) is triton-only. we port this to cuda using nsight compute metrics. reward is augmented with `PR = T_generated / T_total` — if the kernel you sped up was 2% of total runtime, you don't get much credit.
+dr. kernel's pr/prs (reward the model for targeting the actual runtime bottleneck, not trivial sub-ops) is triton-only. i'm porting this to cuda using nsight compute metrics. the reward is scaled by `PR = T_generated / T_total` — if the kernel you optimized was 2% of total runtime, you don't get much credit for speeding it up.
 
 **3. progressive reward curriculum**
-neither kevin nor dr. kernel does staged training. we start with a curriculum:
-- stage 1 (format): reward for producing syntactically valid cuda code
-- stage 2 (compile): reward for successful nvcc compilation
-- stage 3 (correctness): reward for matching pytorch reference output  
-- stage 4 (speed): reward for speedup over pytorch baseline
+neither kevin nor dr. kernel does staged training. i start with a curriculum that unlocks reward components one at a time:
+- stage 1: reward for syntactically valid cuda
+- stage 2: + reward for successful nvcc compilation
+- stage 3: + reward for matching pytorch reference output
+- stage 4: + reward for speedup over pytorch baseline
 
-the idea is that jumping straight to sparse speedup rewards causes the model to thrash early. warming it up through the easier stages first gives a better starting point before the hard signal kicks in.
+jumping straight to sparse speedup rewards causes the model to thrash early when almost everything fails. the curriculum keeps a training signal alive throughout.
 
-**additionally**: cold-start sft phase before any rl (following dr. kernel's lead) — generate synthetic multi-turn trajectories using a strong teacher model, sft on those first, then rl on top. neither kevin nor dr. kernel does this for cuda at 32b scale.
+**additionally**: cold-start sft before any rl, same as dr. kernel — generate multi-turn trajectories using a strong teacher (gpt-4o), sft on those first, then rl on top.
 
-### reward function (sort of naive, values somewhat arbitrary)
+### reward function
 
 ```
 R = R_compile + R_correct + R_speed + R_profiling
@@ -62,62 +77,46 @@ R = R_compile + R_correct + R_speed + R_profiling
 
 | component | value | condition |
 |---|---|---|
-| `R_compile` | +0.1 | code compiles with nvcc |
+| `R_compile` | +0.1 | compiles with nvcc |
 | `R_correct` | +0.4 | output matches pytorch reference |
 | `R_speed` | -0.1 to +0.5 | log-scaled speedup, only if correct |
-| `R_profiling` | 0 to +0.1 | PR weighting, only if correct |
+| `R_profiling` | 0 to +0.1 | pr weighting, only if correct |
 
-speed reward shaping (log-scale to incentivize large wins, not just 1.01x):
-```python
-def speed_reward(speedup):
-    if speedup < 0.8:   return -0.1   # slower than pytorch
-    if speedup < 1.0:   return 0.0    # roughly same
-    return min(0.5, 0.25 * math.log2(speedup))  # 2x→+0.25, 4x→+0.5
-```
+speed reward is log2-scaled so 2x→+0.25, 4x→+0.5 (capped). linear reward would make the model lazy about large speedups.
 
-profiling reward (penalizes lazy optimization):
-```python
-def profiling_reward(pr_ratio):
-    # pr_ratio = T_generated_kernel / T_total_cuda_runtime
-    # if the kernel you optimized was only 5% of runtime, reward is scaled down
-    return 0.1 * pr_ratio
-```
+profiling reward scales down credit if the optimized kernel wasn't the bottleneck — prevents lazy optimization.
 
-anti-reward-hacking: wraps kernelbench's `kernel_static_checker.py` — catches cached computation reuse, input modification, non-default cuda streams.
+anti-reward-hacking via kernelbench's `kernel_static_checker.py` — catches cached computation reuse, input modification, non-default cuda streams.
 
-### benchmarking
-- **primary**: kernelbench eval harness, `fast_p` metrics (fast_0, fast_1, fast_1.2, fast_2) — directly comparable to [kernelsseum leaderboard](https://scalingintelligence.stanford.edu/KernelBenchLeaderboard/)
-- **hardware**: h100 or a100-80gb on modal, `gpu=["H100", "A100-80GB"]` fallback
-- **profiling**: nsight compute (`ncu`) on successful kernels for pr metric + occupancy/cache analysis
-
-### infrastructure
-- **modal** for all gpu work — kernel compilation, correctness checks, benchmarks, rl rollout evaluation, training itself
-- `modal.Function.map()` for parallel candidate evaluation — all G=16 rollouts per problem run simultaneously
-- separate modal containers for rollout workers (vllm inference) vs training workers (verl + deepspeed)
+### infra
+- **modal** for all gpu work — kernel eval, rl rollouts, training
+- each kernel candidate evaluated in its own modal container (h100), parallel via `.map()`
+- kernelbench submodule baked into the modal image at deploy time
 
 ---
 
 ## todos
 
-### phase 1 — environment + baseline
-- [ ] scaffold repo — folder structure, pyproject.toml, deps
-- [ ] clone kernelbench, get single kernel eval running end to end
-- [ ] write modal kernel eval worker — takes kernel code string, returns `{compile_ok, correct, speedup, error_msg, pr_ratio}`
-- [ ] run qwen2.5-coder-32b zero-shot on kernelbench l1 + l2, record fast_0 / fast_1 / fast_1.2 baseline
-- [ ] implement + unit test the full reward function (all 4 components)
-- [ ] integrate kernelbench static checker for anti-cheat
+### phase 1 — environment + baseline ✓
+- [x] scaffold repo — folder structure, pyproject.toml, deps
+- [x] add kernelbench as git submodule, install editable
+- [x] write modal kernel eval worker — compile → static check → correctness → benchmark
+- [x] run qwen2.5-coder-32b zero-shot on kernelbench l1, get baseline numbers
+- [x] implement + unit test the full reward function (all 4 components + curriculum)
+- [x] integrate kernelbench static checker for anti-cheat
 
 ### phase 2 — cold-start sft
-- [ ] generate synthetic multi-turn cuda trajectories using a teacher model (claude / gpt-5) on kernelbench l1/l2 problems
-- [ ] filter trajectories for quality (at least one correct + fast turn in the rollout)
-- [ ] sft qwen2.5-coder-32b on these trajectories with lora — warm start before rl
+- [ ] run full baseline on all 100 l1 problems + 100 l2 problems (not just 20)
+- [ ] generate synthetic multi-turn cuda trajectories using gpt-4o on l1/l2 problems
+- [ ] filter trajectories — keep only rollouts where at least one turn is correct + fast
+- [ ] sft qwen2.5-coder-32b on these trajectories with lora
 
 ### phase 3 — grpo-lora training
 - [ ] set up verl with qwen2.5-coder-32b + lora (rank=16, q/v/o projections)
-- [ ] implement trloo advantage estimation (drop-in replacement for grpo group mean)
+- [ ] implement trloo advantage estimation (drop-in over grpo group mean)
 - [ ] implement progressive curriculum: stage 1→2→3→4 reward unlocking
-- [ ] single-turn grpo training on kernelbench l1 first, validate reward increases + no collapse
-- [ ] add multi-turn loop (up to 4 turns) with compiler error / profiling feedback injection
+- [ ] single-turn grpo on kernelbench l1, validate reward increases + no collapse
+- [ ] add multi-turn loop (up to 4 turns) with compiler error + profiling feedback
 - [ ] hook up nsight compute for pr_ratio metric
 - [ ] train on l1 + l2 combined
 
@@ -125,5 +124,5 @@ anti-reward-hacking: wraps kernelbench's `kernel_static_checker.py` — catches 
 - [ ] switch lora → full fine-tune with deepspeed zero-3 on modal (4–8×h100)
 - [ ] eval on held-out l2 subset — target: beat kevin-32b and dr. kernel-14b on fast_1.2
 - [ ] full kernelbench eval on all 3 levels
-- [ ] ablations: trloo vs standard grpo, with/without profiling reward, with/without curriculum, with/without cold-start sft
+- [ ] ablations: trloo vs grpo, with/without profiling reward, with/without curriculum, with/without cold-start sft
 - [ ] maybe submit to kernelsseum leaderboard

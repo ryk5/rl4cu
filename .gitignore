@@ -1,0 +1,9 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.env
+results/
+*.egg-info/
+.DS_Store
+.devin/
