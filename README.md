@@ -8,6 +8,17 @@ still early, details are in flux
 
 ---
 
+## design choices so far
+
+- Base Model: Qwen2.5-Coder-7B-Instruct as a primary, Qwen2.5-Coder-3B-Instruct as a faster fallback
+  - Justification: grpo on 3B has already been demonstrated to match 8B SFT models on Triton kernels, should fit on a single A100-80GB for RL training
+  - Maybe use DeepSeek-R1-Distill-Qwen-7B, chain of though reasoning might be useful idk
+- RL Algo: GRPO + Multi-Turn
+  - Justification: grpo > rpo saves ~50% gpu memory overhead for training (no critic model needed!), simple
+- 
+
+---
+
 ## todos
 
 - [ ] get the repo scaffolded — folder structure, pyproject, deps
