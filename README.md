@@ -1,10 +1,10 @@
 # rl4cu
 
-using reinforcement learning to teach llms how to write fast cuda kernels. inspired by hls4ml. the idea is that llms are actually pretty bad at writing optimized gpu code out of the box — they can get something that compiles and is maybe correct, but rarely something that's actually fast. so we're using grpo-style rl with execution-based rewards (correctness + speedup vs pytorch baseline) to push the model to learn what makes a kernel actually good.
+using reinforcement learning to teach llms how to write fast cuda kernels. inspired by hls4ml. the idea is that llms are actually pretty bad at writing optimized gpu code out of the box — they can get something that compiles and is maybe correct, but rarely something that's actually fast. so im using [grpo-style rl](https://arxiv.org/pdf/2402.03300) with execution-based rewards (correctness + speedup vs pytorch baseline) to push the model to learn what makes a kernel actually good.
 
-benchmarking against kernelbench (stanford, icml 2025) — 250 problems ranging from single ops to full model architectures. infra runs on modal so we can parallelize kernel compilation + evaluation across many gpus at once.
+benchmarking against [kernelbench (stanford, icml 2025)](https://arxiv.org/abs/2502.10517) which includes 250 problems ranging from single ops to full model architectures. infra runs on modal so I can parallelize kernel compilation + evaluation across many gpus at once.
 
-still early, details are in flux.
+still early, details are in flux 
 
 ---
 
@@ -25,3 +25,4 @@ still early, details are in flux.
 - [ ] switch lora → full fine-tune with deepspeed zero-3 on modal (4-8x h100)
 - [ ] final kernelbench eval on all 3 levels, maybe submit to kernelsseum leaderboard
 - [ ] ablations — single vs multi-turn, reward shaping variants, with/without efficiency reward
+- [ ] see if my thing is actually any good lmao
